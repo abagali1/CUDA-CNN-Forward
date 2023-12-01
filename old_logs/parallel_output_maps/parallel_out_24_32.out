@@ -1,0 +1,8 @@
+Loading fashion-mnist data... done
+Loading model...[16:39:40] src/nnvm/legacy_json_util.cc:209: Loading symbol saved by previous version v0.11.0. Attempting to upgrade...
+[16:39:40] src/nnvm/legacy_json_util.cc:217: Symbol successfully upgraded!
+ done
+New Inference
+Op Time: 0.033414
+Op Time: 0.123813
+Correctness: 0.7955 Model: eecs498

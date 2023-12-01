@@ -6,3 +6,5 @@
 !setup_student.sh
 !submit_code.sh
 !old_logs
+!old_logs/*
+!old_logs/*/*
