@@ -5,6 +5,8 @@
 
 #define CONSTANT_KERNEL
 
+const constexpr int K = 7;
+
 namespace mxnet
 {
 namespace op
@@ -14,7 +16,7 @@ namespace op
 __constant__ float deviceKernel[24 * 12 * 7 * 7];
 #endif
 
-__global__ void base(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
+__global__ void base(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W)
 {
 
     /*
@@ -62,7 +64,7 @@ __global__ void base(float *y, const float *x, const float *k, const int B, cons
 #undef k4d
 }
 
-__global__ void parallel_output(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K, const int D_o, const int BLOCK_SIZE){
+__global__ void parallel_output(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int D_o, const int BLOCK_SIZE){
 
 #define y4d(i3, i2, i1, i0) y[(i3) * (M * D_o * D_o) + (i2) * (D_o * D_o) + (i1) * (D_o) + i0]
 #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
@@ -84,7 +86,9 @@ __global__ void parallel_output(float *y, const float *x, const float *k, const 
     float Pvalue = 0;
     if (row_start < D_o && col_start < D_o) {
         for (int ch = 0; ch < C; ch++) {
+            #pragma unroll
             for (int r = 0; r < K; r++) {
+                #pragma unroll
                 for (int c = 0; c < K; c++) {
                     Pvalue += x4d(bx, ch, row_start + r, col_start + c) * k4d(by, ch, r, c);
                 }
@@ -114,7 +118,6 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     const int C = x.shape_[1];
     const int H = x.shape_[2];
     const int W = x.shape_[3];
-    const int K = w.shape_[3];
 
     const float D_o = H - K + 1;
 
@@ -128,14 +131,14 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     dim3 gridDim((B + 511) / 512);
     dim3 blockDim(512);
 
-    base<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
+    base<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W);
 */
 
     const int BLOCK_SIZE = M == 12 ? 24 : 32;
 
     dim3 gridDim(B, M, pow(ceil(D_o / BLOCK_SIZE), 2)); // images x output_masks x (blocks per image)
     dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE, 1);
-    parallel_output<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K, D_o, BLOCK_SIZE);
+    parallel_output<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, D_o, BLOCK_SIZE);
    
     
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
