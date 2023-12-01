@@ -1,0 +1,8 @@
+*
+!.gitignore
+!build_student.sh
+!new-forward.cuh
+!run_student.sh
+!setup_student.sh
+!submit_code.sh
+!old_logs
