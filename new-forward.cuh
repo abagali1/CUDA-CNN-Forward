@@ -5,7 +5,7 @@
 
 #define CONSTANT_KERNEL
 
-const constexpr int K = 7;
+const constexpr static int K = 7;
 
 namespace mxnet
 {
@@ -64,18 +64,20 @@ __global__ void base(float *y, const float *x, const float *k, const int B, cons
 #undef k4d
 }
 
-__global__ void parallel_output(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int D_o, const int BLOCK_SIZE){
+
+template<const int BLOCK_SIZE, const int CHANNELS, const int D_o>
+__global__ void parallel_output(float * __restrict__ y, const float * const __restrict__ x, const float * const __restrict__ k, const int M, const int H, const int W){
 
 #define y4d(i3, i2, i1, i0) y[(i3) * (M * D_o * D_o) + (i2) * (D_o * D_o) + (i1) * (D_o) + i0]
-#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+#define x4d(i3, i2, i1, i0) x[(i3) * (CHANNELS * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
 
 #ifdef CONSTANT_KERNEL
-#define k4d(i3, i2, i1, i0) deviceKernel[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+#define k4d(i3, i2, i1, i0) deviceKernel[(i3) * (CHANNELS * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 #else
-#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+#define k4d(i3, i2, i1, i0) k[(i3) * (CHANNELS * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 #endif // CONSTANT_KERNEL
 
-    int D_grid = ceil(1.0*D_o / BLOCK_SIZE);
+    const constexpr int D_grid = (D_o / BLOCK_SIZE) + 1;
     
     int bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z;
     int tx = threadIdx.x, ty = threadIdx.y;
@@ -83,9 +85,10 @@ __global__ void parallel_output(float *y, const float *x, const float *k, const 
     int row_start = (bz / D_grid) * BLOCK_SIZE + ty;
     int col_start = (bz % D_grid) * BLOCK_SIZE + tx;
 
-    float Pvalue = 0;
     if (row_start < D_o && col_start < D_o) {
-        for (int ch = 0; ch < C; ch++) {
+        float Pvalue = 0;
+        #pragma unroll
+        for (int ch = 0; ch < CHANNELS; ch++) {
             #pragma unroll
             for (int r = 0; r < K; r++) {
                 #pragma unroll
@@ -96,8 +99,57 @@ __global__ void parallel_output(float *y, const float *x, const float *k, const 
         }
         y4d(bx, by, row_start, col_start) = Pvalue;
     }
+#undef k4d
+#undef y4d
+#undef x4d
 }
 
+
+template<const int TILE_SIZE, const int BLOCK_SIZE>
+__global__ void shared_convolution(float * __restrict__ y, const float * __restrict__ x, const float * __restrict__ k, const int B, const int M, const int C, const int H, const int W, const int D_out)
+{
+#define y4d(i3, i2, i1, i0) y[(i3) * (M * D_out * D_out) + (i2) * (D_out * D_out) + (i1) * (D_out) + i0]
+#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+#ifdef CONSTANT
+#define k4d(i3, i2, i1, i0) deviceKernel[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+#else
+#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+#endif
+
+
+    __shared__ float Xds[BLOCK_SIZE][BLOCK_SIZE][12];
+    int D_grid = ceil(1.0*D_out / TILE_SIZE);
+
+    int bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z;
+    int tx = threadIdx.x, ty = threadIdx.y;
+
+    int row_start = (bz / D_grid) * TILE_SIZE + ty;
+    int col_start = (bz % D_grid) * TILE_SIZE + tx;
+
+    for (int ch = 0; ch < C; ch++) {
+        Xds[ch][ty][tx] = (row_start < H && col_start < W) ? x4d(bx, ch, row_start, col_start) : 0;
+    }
+
+    __syncthreads();
+
+    if (tx < TILE_SIZE && ty < TILE_SIZE && row_start < D_out && col_start < D_out) {
+        float Pvalue = 0;
+        for (int ch = 0; ch < C; ch++)
+            #pragma unroll
+            for (int r = 0; r < K; r++)
+                #pragma unroll
+                for (int c = 0; c < K; c++)
+                    Pvalue += Xds[ch][ty+r][tx+c] * k4d(by, ch, r, c);
+        y4d(bx, by, row_start, col_start) = Pvalue;
+    }
+
+#undef y4d
+#undef x4d
+#undef k4d
+#undef x4ds
+#undef TILE_SIZE
+#undef BLOCK_SIZE
+}
 
 
 /* 
@@ -113,17 +165,13 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     // // Remove this assertion when you do your implementation!
     // CHECK_EQ(0, 1) << "Remove this line and replace with your implementation";
 
-    const int B = x.shape_[0];
+    // const int B = x.shape_[0];
     const int M = y.shape_[1]; // num_filter
-    const int C = x.shape_[1];
-    const int H = x.shape_[2];
-    const int W = x.shape_[3];
+    // const int C = x.shape_[1];
+    // const int H = x.shape_[2];
+    // const int W = x.shape_[3];
 
-    const float D_o = H - K + 1;
-
-#ifdef CONSTANT_KERNEL
-    cudaMemcpyToSymbol(deviceKernel, w.dptr_, M*C*K*K*sizeof(float));
-#endif
+    // const float D_o = H - K + 1;
 
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
 
@@ -134,14 +182,54 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     base<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W);
 */
 
-    const int BLOCK_SIZE = M == 12 ? 24 : 32;
-
-    dim3 gridDim(B, M, pow(ceil(D_o / BLOCK_SIZE), 2)); // images x output_masks x (blocks per image)
-    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE, 1);
-    parallel_output<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, D_o, BLOCK_SIZE);
-   
     
-    MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
+    if(M == 12){
+        constexpr const int B = 10000;
+        constexpr const int C = 1;
+        constexpr const int H = 72;
+        constexpr const int W = 72;
+
+#ifdef CONSTANT_KERNEL
+        cudaMemcpyToSymbol(deviceKernel, w.dptr_, M*C*K*K*sizeof(float));
+#endif
+
+        constexpr const int D_o = H - K + 1; // 66
+        constexpr const int BLOCK_SIZE = 24;
+        constexpr const int grid_z = ((D_o / BLOCK_SIZE) + 1) * ((D_o / BLOCK_SIZE) + 1);
+
+        dim3 gridDim(B, M, grid_z); // images x output_masks x (blocks per image)
+        dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE, 1);
+        parallel_output<BLOCK_SIZE, 1, D_o><<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, M, H, W);
+    }else{
+        constexpr const int B = 10000;
+        constexpr const int C = 12;
+        constexpr const int H = 33;
+        constexpr const int W = 33;
+
+#ifdef CONSTANT_KERNEL
+        cudaMemcpyToSymbol(deviceKernel, w.dptr_, M*C*K*K*sizeof(float));
+#endif
+
+        constexpr const int D_o = H - K + 1; // 27
+        constexpr const int BLOCK_SIZE = 32;
+        constexpr const int grid_z = ((D_o / BLOCK_SIZE) + 1) * ((D_o / BLOCK_SIZE) + 1);
+        
+        dim3 gridDim(B, M, grid_z); // images x output_masks x (blocks per image)
+        dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE, 1);
+        parallel_output<BLOCK_SIZE, 12, D_o><<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, M, H, W);
+    }
+    
+
+   /*
+    constexpr const int TILE_SIZE = 24;
+    constexpr const int BLOCK_SIZE = TILE_SIZE + K - 1;
+    constexpr const int grid_z = ((D_o / BLOCK_SIZE) + 1) * ((D_o / BLOCK_SIZE) + 1);
+
+    dim3 gridDim(B, M, grid_z);
+    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE, 1);
+    shared_convolution<TILE_SIZE, BLOCK_SIZE><<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, D_o);
+    */
+
 }
 
 /* 
