@@ -6,13 +6,15 @@
 #define CONSTANT_KERNEL
 
 const constexpr static int K = 7;
+const constexpr static int B = 10000;
 
 namespace mxnet
 {
 namespace op
 {
 
-__constant__ float deviceKernel[24 * 12 * 7 * 7];
+__constant__ float deviceKernel[12 * 7 * 7];
+
 
 __global__ void base(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W)
 {
@@ -32,7 +34,7 @@ __global__ void base(float *y, const float *x, const float *k, const int B, cons
 // An example use of these macros:
 // float a = y4d(0,0,0,0)
 // y4d(0,0,0,0) = a
-#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (H_out) + i0]
 #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
 
 #ifdef CONSTANT_KERNEL
@@ -77,7 +79,7 @@ __global__ void parallel_output(float * __restrict__ y, const float * const __re
 
     int tmp = bz / D_grid;
     int row_start = tmp * BLOCK_SIZE + ty;
-    int col_start = (bz - tmp * D_grid) * BLOCK_SIZE + tx;
+    int col_start = (bz - tmp * D_grid) * BLOCK_SIZE + tx; // (bz % D_grid)  => (bz - (bz / D_grid) * D_grid)
 
     if (row_start < D_o && col_start < D_o) {
         float Pvalue = 0;
@@ -110,7 +112,6 @@ __global__ void shared_convolution(float * __restrict__ y, const float * __restr
 #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 #endif
 
-
     __shared__ float Xds[BLOCK_SIZE][BLOCK_SIZE][12];
     int D_grid = ceil(1.0*D_out / TILE_SIZE);
 
@@ -141,10 +142,57 @@ __global__ void shared_convolution(float * __restrict__ y, const float * __restr
 #undef x4d
 #undef k4d
 #undef x4ds
-#undef TILE_SIZE
-#undef BLOCK_SIZE
 }
 
+
+template<const int BLOCK_SIZE, const int C, const int D_out, const int M, const int H, const int W>
+__global__ void fused_unroll_gemm(float * __restrict__ y, const float * __restrict__ x, const float * __restrict__ k){
+#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+#define y4d(i3, i2, i1, i0) y[(i3) * (M * numBColumns) + (i2) * (numBColumns) + (i1) * (D_out) + i0]
+
+    __shared__ float Mds[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float Nds[BLOCK_SIZE][BLOCK_SIZE];
+
+    constexpr const int numAColumns = C * K * K;
+    constexpr const int numBColumns = D_out * D_out;
+    constexpr const int k2 = K * K;
+
+    int bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z;
+    int tx = threadIdx.x, ty = threadIdx.y;
+
+    int out_idx = bx * BLOCK_SIZE + tx;
+    int mask_out = by * BLOCK_SIZE + ty;
+    
+    int h_out = out_idx / D_out;
+
+    float Pvalue = 0;
+    #pragma unroll
+    for (int i = 0; i < numAColumns/BLOCK_SIZE + 1; ++i) {
+        int r = i * BLOCK_SIZE + ty;
+        int c = i * BLOCK_SIZE + tx;
+
+        int mask_in = r / k2;
+        int tmp = r - k2 * mask_in; // r % K2
+
+        int tk = tmp / K;
+        int w_unrolled = (out_idx - h_out * D_out) + (tmp - tk * K); // out_idx % D_out + (r % K2) % K
+
+        Nds[ty][tx] = (r < numAColumns && out_idx < numBColumns) ? x4d(bz, mask_in, h_out + tk, w_unrolled) : 0;
+        Mds[ty][tx] = (mask_out < M && c < numAColumns) ? k[mask_out * numAColumns + c] : 0;
+
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < BLOCK_SIZE; ++k)
+            Pvalue += Mds[ty][k] * Nds[k][tx];
+        __syncthreads();
+    }
+    
+    if (mask_out < M && out_idx < numBColumns)
+        y4d(bz, mask_out, h_out, out_idx - h_out * D_out) = Pvalue; // out_idx, out_idx % D_out
+
+#undef y4d
+#undef x4d
+}
 
 /* 
    This function is called by new-inl.h
@@ -167,8 +215,6 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
 
     // const float D_o = H - K + 1;
 
-    MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
-
 /*
     dim3 gridDim((B + 511) / 512);
     dim3 blockDim(512);
@@ -176,6 +222,7 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     base<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W);
 */
 
+    /*
     cudaStream_t s = 0;
     if(M == 12){
         constexpr const int B = 10000;
@@ -208,7 +255,7 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
         dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE, 1);
         parallel_output<BLOCK_SIZE, 12, D_o, 24, H, W><<<gridDim, blockDim, 0, s>>>(y.dptr_, x.dptr_);
     }
-    
+    */
 
    /*
     constexpr const int TILE_SIZE = 24;
@@ -220,6 +267,34 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     shared_convolution<TILE_SIZE, BLOCK_SIZE><<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, D_o);
     */
 
+
+    if(M == 12){
+        constexpr const int BLOCK_SIZE = 24;
+        constexpr const int C = 1;
+        constexpr const int H = 72;
+        constexpr const int W = 72;
+
+        constexpr const int D_o = H - K + 1; // 66
+        constexpr const int grid_z = ((D_o / BLOCK_SIZE) + 1) * ((D_o / BLOCK_SIZE) + 1);
+
+        cudaMemcpyToSymbol(deviceKernel, w.dptr_, 12*49*sizeof(float), 0, cudaMemcpyDeviceToDevice);
+
+        dim3 gridDim(B, M, grid_z); // images x output_masks x (blocks per image)
+        dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE, 1);
+        parallel_output<BLOCK_SIZE, C, D_o, 12, H, W><<<gridDim, blockDim>>>(y.dptr_, x.dptr_);
+    }
+    else{
+        constexpr const int BLOCK_SIZE = 24;
+        constexpr const int C = 12;
+        constexpr const int H = 33;
+        constexpr const int W = 33;
+
+        constexpr const int D_o = H - K + 1; // 27
+
+        dim3 gridDim((D_o * D_o)/BLOCK_SIZE + 1, 1, B);
+        dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE, 1);
+        fused_unroll_gemm<BLOCK_SIZE, C, D_o, 24, H, W><<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_);
+    }
 }
 
 /* 
