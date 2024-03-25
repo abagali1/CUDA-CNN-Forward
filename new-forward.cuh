@@ -19,13 +19,6 @@ __constant__ float deviceKernel[12 * 7 * 7];
 __global__ void base(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W)
 {
 
-    /*
-    Modify this function to implement the forward pass described in Chapter 16.
-    We have added an additional dimension to the tensors to support an entire mini-batch
-    The goal here is to be correct AND fast.
-    We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
-    */
-
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
     (void)H_out; // silence declared but never referenced warning. remove this line when you start working
@@ -297,14 +290,10 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     }
 }
 
-/* 
-    This tells mxnet how to do an op when it's not a float.
-    This is not used in the ECE408 project
-*/
 template <typename gpu, typename DType>
 void forward(mshadow::Tensor<gpu, 4, DType> &y, const mshadow::Tensor<gpu, 4, DType> &x, const mshadow::Tensor<gpu, 4, DType> &w)
 {
-    assert(0 && "No forward implementation for other datatypes needed for ECE408");
+    assert(0 && "No forward implementation for other datatypes");
 }
 }
 }
